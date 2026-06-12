@@ -55,3 +55,9 @@
 /* base */
 @import './base/layout.css';
 @import './base/app_splash.css';
+
+/* legacy RPG shell is no longer active after replacing it with novel mode */
+#rpg-teleport-screen,
+.rpg-teleport-screen {
+    display: none !important;
+}
