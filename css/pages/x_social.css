@@ -4,8 +4,8 @@
 }
 
 .x-topbar {
-    height: 60px;
-    padding: 8px 12px;
+    min-height: calc(60px + var(--safe-top));
+    padding: calc(8px + var(--safe-top)) 12px 8px;
     display: flex;
     align-items: center;
     justify-content: space-between;
