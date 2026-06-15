@@ -1,6 +1,6 @@
 // --- sw.js ---
 
-const CACHE_NAME = 'qchat-cache-Q1.6.1';
+const CACHE_NAME = 'qchat-cache-Q1.6.1-keepalive-330';
 // 每次部署新版本时，把上面的 v1 改成 v2、v3...
 // SW 会自动清理旧缓存，确保用户拿到最新文件
 
@@ -26,8 +26,23 @@ self.addEventListener('activate', (event) => {
     );
 });
 
+setInterval(() => {
+    self.clients.matchAll({ includeUncontrolled: true, type: 'window' }).then(clients => {
+        clients.forEach(client => {
+            client.postMessage({ type: 'KEEP_ALIVE_CHECK', at: Date.now() });
+        });
+    });
+}, 20000);
+
 self.addEventListener('fetch', (event) => {
     const url = new URL(event.request.url);
+    if (url.pathname.includes('/_keep_alive_ping_')) {
+        event.respondWith(new Response('pong', {
+            status: 200,
+            headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+        }));
+        return;
+    }
 
     // 非同源请求（postimg、外部字体等）直接放行，不走缓存
     if (url.origin !== location.origin) {
@@ -72,6 +87,17 @@ self.addEventListener('fetch', (event) => {
 });
 
 // 监听系统发起的周期性后台同步
+self.addEventListener('message', (event) => {
+    if (!event.data || event.data.type !== 'KEEP_ALIVE_PING') return;
+    event.waitUntil(
+        self.clients.matchAll({ includeUncontrolled: true, type: 'window' }).then(clients => {
+            clients.forEach(client => {
+                client.postMessage({ type: 'KEEP_ALIVE_CHECK', at: Date.now() });
+            });
+        })
+    );
+});
+
 self.addEventListener('periodicsync', (event) => {
     if (event.tag === 'check-proactive') {
         console.log('[SW] 系统触发了 Periodic Sync，准备唤醒前台页面...');
@@ -89,4 +115,17 @@ self.addEventListener('periodicsync', (event) => {
             })
         );
     }
+});
+
+self.addEventListener('notificationclick', (event) => {
+    event.notification.close();
+    event.waitUntil(
+        self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
+            for (const client of clients) {
+                if ('focus' in client) return client.focus();
+            }
+            if (self.clients.openWindow) return self.clients.openWindow('./index.html');
+            return undefined;
+        })
+    );
 });
