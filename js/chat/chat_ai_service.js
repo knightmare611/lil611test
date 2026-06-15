@@ -193,7 +193,7 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
         }
         // ======== 👆 修复结束 👆 ========
 
-        if (targetChatType === 'private' && (chat.offlineModeEnabled || chat.callMode === 'video')) {
+        if ((targetChatType === 'private' && (chat.offlineModeEnabled || chat.callMode === 'video')) || (targetChatType === 'group' && chat.offlineModeEnabled)) {
             let processed = cleanResponse;
             processed = processed.replace(/\r\n/g, '\n');
             processed = processed.replace(/([^\n])\s*(\[.*?[:：])/g, '$1\n$2');
@@ -204,6 +204,35 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
             
             const lines = processed.split('\n');
             let isFirstLine = true;
+            const groupSpeakerNames = targetChatType === 'group'
+                ? (chat.members || []).map(member => {
+                    const names = [];
+                    if (member.realName) names.push(member.realName);
+                    if (member.groupNickname) names.push(member.groupNickname);
+                    if (member.originalCharId && typeof db !== 'undefined') {
+                        const originalChar = db.characters.find(c => c.id === member.originalCharId);
+                        if (originalChar?.realName) names.push(originalChar.realName);
+                        if (originalChar?.remarkName) names.push(originalChar.remarkName);
+                    }
+                    return names;
+                }).flat().filter(Boolean).sort((a, b) => b.length - a.length)
+                : [];
+            const fallbackGroupSpeaker = targetChatType === 'group'
+                ? groupSpeakerNames[0] || chat.members?.[0]?.realName || chat.members?.[0]?.groupNickname || '群聊成员'
+                : '';
+
+            const parseGroupOfflineSpeech = (rawSpeech) => {
+                let speech = rawSpeech.trim();
+                let speaker = fallbackGroupSpeaker;
+                for (const name of groupSpeakerNames) {
+                    if (speech.startsWith(`${name}:`) || speech.startsWith(`${name}：`)) {
+                        speaker = name;
+                        speech = speech.slice(name.length + 1).trim();
+                        break;
+                    }
+                }
+                return { speaker, speech };
+            };
 
             for (let line of lines) {
                 line = line.trim();
@@ -250,14 +279,26 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
                     let speech = line.substring(3).trim();
                     speech = speech.replace(/\]+$/, '');
                     speech = speech.replace(/^["'「『""'']+/, '').replace(/["'」』""'']+$/, '');
-                    messageContent = `[${chat.realName}的消息：${speech}]`;
+                    if (targetChatType === 'group') {
+                        const parsed = parseGroupOfflineSpeech(speech);
+                        messageContent = `[${parsed.speaker}的消息：${parsed.speech}]`;
+                    } else {
+                        messageContent = `[${chat.realName}的消息：${speech}]`;
+                    }
                 } 
                 else if (/^\[.*?的消息：[\s\S]+?\]$/.test(line)) {
+                    const speakerMatch = line.match(/^\[(.*?)的消息：([\s\S]+?)\]$/);
+                    const originalSpeaker = speakerMatch ? speakerMatch[1] : '';
                     const match = line.match(/^\[.*?的消息：([\s\S]+?)\]$/);
                     let speech = match ? match[1] : line;
                     speech = speech.replace(/\]+$/, '');
                     speech = speech.replace(/^["'「『""'']+/, '').replace(/["'」』""'']+$/, '');
-                    messageContent = `[${chat.realName}的消息：${speech}]`;
+                    if (targetChatType === 'group') {
+                        const parsed = parseGroupOfflineSpeech(`${originalSpeaker}：${speech}`);
+                        messageContent = `[${parsed.speaker}的消息：${parsed.speech}]`;
+                    } else {
+                        messageContent = `[${chat.realName}的消息：${speech}]`;
+                    }
                 } 
                 else {           
                     let rawText = line.trim();
@@ -710,6 +751,7 @@ ${chat.realName}愣了一下，指尖无意识地摩挲着杯沿。
 let groupOfflineReinforcement = null;
 if (chatType === 'group' && chat.offlineModeEnabled) {
     const myName = chat.me?.realName || chat.me?.nickname || '用户';
+    const worldBooksWriting = (chat.worldBookIds ||[]).map(id => db.worldBooks.find(wb => wb.id === id && wb.position === 'writing')).filter(Boolean).map(wb => wb.content).join('');
     const memberNames = (chat.members || [])
         .map(member => {
             if (member.originalCharId) {
@@ -720,15 +762,48 @@ if (chatType === 'group' && chat.offlineModeEnabled) {
         })
         .filter(Boolean)
         .join('、');
-    groupOfflineReinforcement = `[🛑 群聊线下模式写作手册]
-1. 当前是面对面群体互动，不是手机群聊。请把重点放在空间、动作、语气、距离和多人反应上。
-2. 参与者：${myName}${memberNames ? `、${memberNames}` : ''}。每个角色都必须符合各自人设，不要让所有人用同一种说话方式。
-3. 输出只能使用两类格式：
-   - [system-narration: 场景、动作、气氛或多人同时发生的细节]
-   - [{成员真名}的消息：角色说出口的话]
-4. 不要输出表情包、语音、照片/视频、引用、HTML、转账、礼物或手机通知类格式。
-5. 旁白要克制，避免连续重复描写同一个环境、眼神、声音或姿势。角色行动需要有物理连续性。
-6. 根据下方${myName}的最新动态，自然续写群体互动。]\n\n`;
+    groupOfflineReinforcement = `[🛑 严格执行以下写作手册]
+## 1. 🧠 动笔前的快速自问（100字以内，无需输出，心底自问）
+1. **人设**：**往上看一眼群聊最后的互动内容**，根据每个群成员的人设，他们现在会是什么心境？
+2. **回应**：${myName}说的话/行为，重点是哪个词？哪几个成员最该回应？谁会沉默、谁会插话？
+3. **意图**：${myName}这句话/行为，各成员会怎么理解？会觉得是试探、关心、玩笑、挑衅，还是随口一说？
+4. **时间**：现在是什么季节？是几点？
+5. **查重**：上一轮回复里是不是已经描写过同一个环境、声音、眼神或姿势？如果有，这一轮**绝对禁止**再次描写这些内容。
+
+## 2. ✍️ 写作六大原则
+${worldBooksWriting ? `1. **文风第一**：严格遵循【写作风格】设定：${worldBooksWriting}` : ''}
+2. **人设为本**：每个群成员的反应必须符合他/她的设定。参与者：${myName}${memberNames ? `、${memberNames}` : ''}。
+3. **拒绝"网文味"和"古早言情土味"**：
+   - **严禁**使用"邪魅一笑"、"宠溺"、"彻底沦陷"、"命都给你"、"揉进骨血"等廉价网文词汇。
+   - 保持文字的**现实逻辑**。真实的人不会立刻承认自己"输了"或"栽了"，不会直接投降。
+4. **逻辑严密**：物理动作连续，物品去向明确，空间距离合理，时间流逝合理。
+5. **渐进变化**：群成员的情绪和情境转变要合理，避免过度煽情。
+6. **拒绝冗余和重复**：
+   - **严禁**连续两轮使用相同的比喻和形容词，如果想不到新的，就不要使用，改成白描。
+   - 除非环境和角色状态变化，否则**绝对不要**反复描写同一个环境和状态。
+
+## 3. 📤 强制输出格式
+1. **叙事与对话**：像 OUO 私聊线下模式一样，自由混合第三人称描写和对话。
+2. **角色说出口的话**：每句角色嘴巴说出口的话行首必须加 \`>>>成员真名：\`，且不加引号。成员真名必须来自群成员列表。
+3. **心理活动**：角色内心独白或一闪而过的念头，请用**单星号**包裹。
+   - 格式：\`*心里的想法*\`
+4. **状态速写（频繁更新）**：
+   - 格式：\`[成员真名更新状态为：动作或心情速写]\`
+5. **人称**：全文使用"他/她"或成员真名指代角色，使用"你"指代${myName}，绝不使用"我"。
+
+**输出示例**：
+\`\`\`
+空气停了一瞬，桌边几个人的视线不约而同落到你身上。
+*她刚才那句话，到底是随口一问，还是已经察觉到了什么？*
+某个成员指尖轻轻敲了敲杯沿，先移开了目光。
+>>>成员真名：...嗯，也没什么要紧的。[成员真名更新状态为：垂眸掩饰情绪]
+\`\`\`
+
+## 4.🛑 **动笔前的自我灵魂拷问**：
+1. **人设校验**：回到最上方，重新浏览一遍群成员档案，问自己：每个反应符合对应角色的性格吗？如果不符合，调整到符合为止。
+2. **禁词检查**：如果不幸写出了网文的油腻土味，例如"宠溺"、"我栽了"、"彻底输了"等字眼，**请立刻将其删除**，并改写为一个具体的、无言的动作。
+
+现在，根据下方${myName}的最新动态开始创作。深呼吸，回想一下每个群成员的人设，然后自然地续写接下来的剧情。\n\n`;
 }
         
         // 视频通话写作手册（在 chat_feature_call.js 的 generateCallVideoReinforcement 中独立配置）
