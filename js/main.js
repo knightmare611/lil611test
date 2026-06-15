@@ -423,6 +423,7 @@ window.init = async () => {
         if (typeof setupUserPersonaScreen === 'function') setupUserPersonaScreen();
         if (typeof setupGroupInfoScreen === 'function') setupGroupInfoScreen();
         setupMobileKeyboardRecovery();
+        setupBackgroundNotificationTestBridge();
 
         // 绑定特殊按钮
         const delWbBtn = document.getElementById('delete-selected-world-books-btn');
@@ -497,10 +498,111 @@ async function runDailyBackupCheck() {
 // ==========================================
 
 // A. Service Worker 注册与后台唤醒监听
+let ouoKeepAliveHeartbeatStarted = false;
+let ouoKeepAliveWorker = null;
+
+function shouldRunOuoKeepAlive() {
+    if (typeof isBackgroundActivityEnabled === 'function' && !isBackgroundActivityEnabled()) return false;
+    if (typeof getBackgroundActivitySettings !== 'function') return true;
+    const settings = getBackgroundActivitySettings();
+    return settings.enabled !== false && !!settings.keepAliveForced;
+}
+
+function runOuoBackgroundCheck(reason = 'keepalive') {
+    if (typeof isBackgroundActivityEnabled === 'function' && !isBackgroundActivityEnabled()) return;
+    console.log(`[keepalive] background check: ${reason}`);
+    if (typeof checkAndDeliverProactiveMessages === 'function') {
+        checkAndDeliverProactiveMessages();
+    }
+    if (typeof triggerIdleProactiveGeneration === 'function') {
+        triggerIdleProactiveGeneration();
+    }
+}
+
+function startOuoServiceWorkerHeartbeat() {
+    if (ouoKeepAliveHeartbeatStarted) return;
+    ouoKeepAliveHeartbeatStarted = true;
+
+    const pingServiceWorker = () => {
+        if (!shouldRunOuoKeepAlive()) return;
+        if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+            navigator.serviceWorker.controller.postMessage({ type: 'KEEP_ALIVE_PING', at: Date.now() });
+        }
+    };
+
+    const pingFetch = () => {
+        if (!shouldRunOuoKeepAlive()) return;
+        fetch('./_keep_alive_ping_', { cache: 'no-store' }).catch(() => {});
+    };
+
+    setInterval(pingServiceWorker, 10000);
+    setInterval(pingFetch, 25000);
+    pingServiceWorker();
+    pingFetch();
+
+    try {
+        const workerCode = `
+            setInterval(() => {
+                postMessage({ type: 'KEEP_ALIVE_TICK', at: Date.now() });
+            }, 15000);
+        `;
+        const blob = new Blob([workerCode], { type: 'application/javascript' });
+        ouoKeepAliveWorker = new Worker(URL.createObjectURL(blob));
+        ouoKeepAliveWorker.onmessage = () => pingServiceWorker();
+    } catch (err) {
+        console.log('[keepalive] worker heartbeat unavailable:', err);
+    }
+}
+
+async function sendBackgroundSystemNotification(title, options = {}) {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return false;
+    try {
+        if ('serviceWorker' in navigator) {
+            const reg = await navigator.serviceWorker.ready;
+            if (reg && typeof reg.showNotification === 'function') {
+                await reg.showNotification(title, {
+                    badge: './icon/icon_cat.png',
+                    icon: './icon/icon_cat.png',
+                    ...options
+                });
+                return true;
+            }
+        }
+    } catch (err) {
+        console.log('[notification] service worker notification failed:', err);
+    }
+    try {
+        new Notification(title, options);
+        return true;
+    } catch (err) {
+        console.log('[notification] page notification failed:', err);
+        return false;
+    }
+}
+window.sendBackgroundSystemNotification = sendBackgroundSystemNotification;
+
+function setupBackgroundNotificationTestBridge() {
+    const btn = document.getElementById('background-notification-test-btn');
+    if (!btn || btn.dataset.ouoNotificationBridge === '1') return;
+    btn.dataset.ouoNotificationBridge = '1';
+    btn.addEventListener('click', async (event) => {
+        if (!('Notification' in window) || Notification.permission !== 'granted') return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        const sent = await sendBackgroundSystemNotification('OUO后台活动测试', {
+            body: '角色后台活动通知可以正常显示。'
+        });
+        if (!sent && typeof showToast === 'function') {
+            showToast('系统通知发送失败，请检查浏览器权限');
+        }
+    }, true);
+}
+
 if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
         navigator.serviceWorker.register('./js/sw.js')
             .then(async reg => {
+                startOuoServiceWorkerHeartbeat();
                 console.log('✅ SW 注册成功:', reg.scope);
                 
                 // 尝试注册周期性后台同步 (Periodic Background Sync)
@@ -529,11 +631,11 @@ if ('serviceWorker' in navigator) {
                 console.log('🔔 [后台唤醒] 收到 Service Worker 信号，开始执行主动消息检测！');
                 
                 // 收到暗号后，立刻执行那两个核心的主动消息函数
-                if (typeof checkAndDeliverProactiveMessages === 'function' && (typeof isBackgroundActivityEnabled !== 'function' || isBackgroundActivityEnabled())) {
-                    checkAndDeliverProactiveMessages();
-                }
-                if (typeof triggerIdleProactiveGeneration === 'function' && (typeof isBackgroundActivityEnabled !== 'function' || isBackgroundActivityEnabled())) {
-                    triggerIdleProactiveGeneration();
+                runOuoBackgroundCheck('periodic-sync');
+            }
+            if (event.data && event.data.type === 'KEEP_ALIVE_CHECK') {
+                if (shouldRunOuoKeepAlive()) {
+                    runOuoBackgroundCheck('service-worker-heartbeat');
                 }
             }
         });
