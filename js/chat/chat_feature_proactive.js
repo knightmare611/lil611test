@@ -498,6 +498,10 @@ async function checkAndDeliverProactiveMessages() {
 
     if (hasDelivered && typeof renderChatList === 'function') { renderChatList(); }
     if (hasDelivered && getBackgroundActivitySettings().notificationsEnabled && 'Notification' in window && Notification.permission === 'granted') {
+        if (typeof window.sendBackgroundSystemNotification === 'function') {
+            const sent = await window.sendBackgroundSystemNotification('有新的后台角色消息', { body: '打开OUO查看刚刚收到的消息。' });
+            if (sent) return;
+        }
         new Notification('有新的后台角色消息', { body: '打开OUO查看刚刚收到的消息。' });
     }
 }
