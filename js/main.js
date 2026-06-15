@@ -500,6 +500,7 @@ async function runDailyBackupCheck() {
 // A. Service Worker 注册与后台唤醒监听
 let ouoKeepAliveHeartbeatStarted = false;
 let ouoKeepAliveWorker = null;
+let ouoServiceWorkerRegistration = null;
 
 function shouldRunOuoKeepAlive() {
     if (typeof isBackgroundActivityEnabled === 'function' && !isBackgroundActivityEnabled()) return false;
@@ -525,8 +526,12 @@ function startOuoServiceWorkerHeartbeat() {
 
     const pingServiceWorker = () => {
         if (!shouldRunOuoKeepAlive()) return;
-        if (navigator.serviceWorker && navigator.serviceWorker.controller) {
-            navigator.serviceWorker.controller.postMessage({ type: 'KEEP_ALIVE_PING', at: Date.now() });
+        const worker = navigator.serviceWorker?.controller
+            || ouoServiceWorkerRegistration?.active
+            || ouoServiceWorkerRegistration?.waiting
+            || ouoServiceWorkerRegistration?.installing;
+        if (worker) {
+            worker.postMessage({ type: 'KEEP_ALIVE_PING', at: Date.now() });
         }
     };
 
@@ -600,8 +605,15 @@ function setupBackgroundNotificationTestBridge() {
 
 if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
-        navigator.serviceWorker.register('./js/sw.js')
+        navigator.serviceWorker.getRegistration('./js/').then(oldReg => {
+            if (oldReg && oldReg.active && oldReg.active.scriptURL.includes('/js/sw.js')) {
+                oldReg.unregister();
+            }
+        }).catch(() => {});
+
+        navigator.serviceWorker.register('./sw.js')
             .then(async reg => {
+                ouoServiceWorkerRegistration = reg;
                 startOuoServiceWorkerHeartbeat();
                 console.log('✅ SW 注册成功:', reg.scope);
                 
