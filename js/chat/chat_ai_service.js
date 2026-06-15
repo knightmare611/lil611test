@@ -204,7 +204,7 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
             
             const lines = processed.split('\n');
             let isFirstLine = true;
-            const groupSpeakerNames = targetChatType === 'group'
+            const groupSpeakerAliases = targetChatType === 'group'
                 ? (chat.members || []).map(member => {
                     const names = [];
                     if (member.realName) names.push(member.realName);
@@ -214,24 +214,33 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
                         if (originalChar?.realName) names.push(originalChar.realName);
                         if (originalChar?.remarkName) names.push(originalChar.remarkName);
                     }
-                    return names;
-                }).flat().filter(Boolean).sort((a, b) => b.length - a.length)
+                    return names.filter(Boolean).map(name => ({
+                        name,
+                        memberId: member.id,
+                        displayName: member.realName || member.groupNickname || name
+                    }));
+                }).flat().sort((a, b) => b.name.length - a.name.length)
                 : [];
             const fallbackGroupSpeaker = targetChatType === 'group'
-                ? groupSpeakerNames[0] || chat.members?.[0]?.realName || chat.members?.[0]?.groupNickname || '群聊成员'
+                ? chat.members?.[0]?.realName || chat.members?.[0]?.groupNickname || groupSpeakerAliases[0]?.displayName || '群聊成员'
                 : '';
+            const fallbackGroupSenderId = targetChatType === 'group'
+                ? chat.members?.[0]?.id || groupSpeakerAliases[0]?.memberId || null
+                : null;
 
             const parseGroupOfflineSpeech = (rawSpeech) => {
                 let speech = rawSpeech.trim();
                 let speaker = fallbackGroupSpeaker;
-                for (const name of groupSpeakerNames) {
-                    if (speech.startsWith(`${name}:`) || speech.startsWith(`${name}：`)) {
-                        speaker = name;
-                        speech = speech.slice(name.length + 1).trim();
+                let senderId = fallbackGroupSenderId;
+                for (const alias of groupSpeakerAliases) {
+                    if (speech.startsWith(`${alias.name}:`) || speech.startsWith(`${alias.name}：`)) {
+                        speaker = alias.displayName;
+                        senderId = alias.memberId;
+                        speech = speech.slice(alias.name.length + 1).trim();
                         break;
                     }
                 }
-                return { speaker, speech };
+                return { speaker, speech, senderId };
             };
 
             for (let line of lines) {
@@ -275,6 +284,7 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
                 }
 
                 let messageContent = "";
+                let offlineGroupSenderId = null;
                 if (line.startsWith('>>>')) {
                     let speech = line.substring(3).trim();
                     speech = speech.replace(/\]+$/, '');
@@ -282,6 +292,7 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
                     if (targetChatType === 'group') {
                         const parsed = parseGroupOfflineSpeech(speech);
                         messageContent = `[${parsed.speaker}的消息：${parsed.speech}]`;
+                        offlineGroupSenderId = parsed.senderId;
                     } else {
                         messageContent = `[${chat.realName}的消息：${speech}]`;
                     }
@@ -296,6 +307,7 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
                     if (targetChatType === 'group') {
                         const parsed = parseGroupOfflineSpeech(`${originalSpeaker}：${speech}`);
                         messageContent = `[${parsed.speaker}的消息：${parsed.speech}]`;
+                        offlineGroupSenderId = parsed.senderId;
                     } else {
                         messageContent = `[${chat.realName}的消息：${speech}]`;
                     }
@@ -327,6 +339,9 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
                     parts:[{ type: 'text', text: messageContent }],
                     timestamp: Date.now()
                 };
+                if (targetChatType === 'group' && offlineGroupSenderId) {
+                    message.senderId = offlineGroupSenderId;
+                }
                 if (chat.currentCallSessionId) message.callSessionId = chat.currentCallSessionId;
                 chat.history.push(message);
                 addMessageBubble(message, targetChatId, targetChatType);
