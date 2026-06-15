@@ -124,9 +124,11 @@ function generateGroupSystemPrompt(group, retrievedContext = '') {
     if (isOfflineMode) {
         prompt += `【群聊线下模式指令】\n${offlineInstruction}\n\n`;
         prompt += `线下模式规则：\n`;
+        prompt += `- 除非用户明确要求外，回复必须使用简体中文；不要写英文叙事、英文台词或英文角色称呼。\n`;
         prompt += `- 当前使用 OUO 私聊线下模式同款写法：像实时续写小说一样输出，不要写成手机聊天。\n`;
         prompt += `- 叙事、动作、环境、心理描写直接写成普通段落，系统会自动渲染为旁白气泡；不要使用 [system-narration: ...]。\n`;
         prompt += `- 角色真正说出口的话行首必须使用 >>>成员真名：台词。成员真名必须来自群成员列表，方便系统分配头像。\n`;
+        prompt += `- 不要输出“成员真名”这四个字，也不要输出 Member、Character 等英文占位词；必须替换为群成员列表里的具体名字。\n`;
         prompt += `- 心理活动用单星号包裹；状态速写使用 [成员真名更新状态为：动作或心情速写]。\n`;
         prompt += `- 让不同成员根据各自人设、关系和最近上下文自然参与，不要让所有人用同一种语气。\n\n`;
     }

@@ -187,6 +187,15 @@ function createMessageBubbleElement(message) {
     const themeKey = chat.theme || 'white_blue';
     const theme = colorThemes[themeKey] || colorThemes['white_blue'];
     let messageSenderId = isSent ? 'user_me' : senderId;
+    const resolveGroupSenderFromContent = () => {
+        if (currentChatType !== 'group' || isSent || senderId || !chat.members) return null;
+        const nameMatch = String(content || '').match(/^\[(.*?)的消息[:：]/);
+        const contentName = nameMatch ? nameMatch[1].trim() : '';
+        if (!contentName) return null;
+        return chat.members.find(member =>
+            member.realName === contentName || member.groupNickname === contentName
+        ) || null;
+    };
 
     if (isSent) {
         avatarUrl = (currentChatType === 'private') ? chat.myAvatar : chat.me.avatar;
@@ -195,8 +204,10 @@ function createMessageBubbleElement(message) {
         if (currentChatType === 'private') {
             avatarUrl = chat.avatar;
         } else {
-            const sender = chat.members.find(m => m.id === senderId);
+            const contentSender = resolveGroupSenderFromContent();
+            const sender = chat.members.find(m => m.id === senderId) || contentSender;
             if (sender) {
+                messageSenderId = sender.id;
                 avatarUrl = sender.avatar;
                 senderNickname = sender.groupNickname;
             } else {

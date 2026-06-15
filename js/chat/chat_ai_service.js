@@ -204,6 +204,12 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
             
             const lines = processed.split('\n');
             let isFirstLine = true;
+            const normalizeGroupSpeakerName = (value = '') => String(value)
+                .replace(/^>>>/, '')
+                .replace(/^[\[\]【】"'“”‘’「」『』]+|[\[\]【】"'“”‘’「」『』]+$/g, '')
+                .replace(/\s+/g, '')
+                .toLowerCase();
+
             const groupSpeakerAliases = targetChatType === 'group'
                 ? (chat.members || []).map(member => {
                     const names = [];
@@ -216,6 +222,7 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
                     }
                     return names.filter(Boolean).map(name => ({
                         name,
+                        key: normalizeGroupSpeakerName(name),
                         memberId: member.id,
                         displayName: member.realName || member.groupNickname || name
                     }));
@@ -232,14 +239,37 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
                 let speech = rawSpeech.trim();
                 let speaker = fallbackGroupSpeaker;
                 let senderId = fallbackGroupSenderId;
-                for (const alias of groupSpeakerAliases) {
-                    if (speech.startsWith(`${alias.name}:`) || speech.startsWith(`${alias.name}：`)) {
-                        speaker = alias.displayName;
-                        senderId = alias.memberId;
-                        speech = speech.slice(alias.name.length + 1).trim();
-                        break;
+
+                const applyAlias = (alias, nextSpeech) => {
+                    speaker = alias.displayName;
+                    senderId = alias.memberId;
+                    speech = nextSpeech.trim();
+                };
+
+                const speakerMatch = speech.match(/^(.{1,40}?)[：:]\s*([\s\S]+)$/);
+                if (speakerMatch) {
+                    const candidate = speakerMatch[1].trim();
+                    const candidateKey = normalizeGroupSpeakerName(candidate);
+                    const alias = groupSpeakerAliases.find(item =>
+                        item.key && (candidateKey === item.key || candidateKey.includes(item.key) || item.key.includes(candidateKey))
+                    );
+                    if (alias) {
+                        applyAlias(alias, speakerMatch[2]);
+                    } else {
+                        speech = speakerMatch[2].trim();
+                    }
+                } else {
+                    for (const alias of groupSpeakerAliases) {
+                        const aliasKey = alias.key;
+                        const speechKey = normalizeGroupSpeakerName(speech.slice(0, alias.name.length + 2));
+                        if (aliasKey && speechKey.startsWith(aliasKey)) {
+                            applyAlias(alias, speech.slice(alias.name.length).replace(/^[：:\s]+/, ''));
+                            break;
+                        }
                     }
                 }
+
+                speech = speech.replace(/^(成员真名|群聊成员|member|character)\s*[：:]\s*/i, '').trim();
                 return { speaker, speech, senderId };
             };
 
@@ -339,8 +369,8 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
                     parts:[{ type: 'text', text: messageContent }],
                     timestamp: Date.now()
                 };
-                if (targetChatType === 'group' && offlineGroupSenderId) {
-                    message.senderId = offlineGroupSenderId;
+                if (targetChatType === 'group') {
+                    message.senderId = offlineGroupSenderId || fallbackGroupSenderId;
                 }
                 if (chat.currentCallSessionId) message.callSessionId = chat.currentCallSessionId;
                 chat.history.push(message);
@@ -798,13 +828,14 @@ ${worldBooksWriting ? `1. **文风第一**：严格遵循【写作风格】设�
    - 除非环境和角色状态变化，否则**绝对不要**反复描写同一个环境和状态。
 
 ## 3. 📤 强制输出格式
-1. **叙事与对话**：像 OUO 私聊线下模式一样，自由混合第三人称描写和对话。
-2. **角色说出口的话**：每句角色嘴巴说出口的话行首必须加 \`>>>成员真名：\`，且不加引号。成员真名必须来自群成员列表。
-3. **心理活动**：角色内心独白或一闪而过的念头，请用**单星号**包裹。
+1. **语言**：除非${myName}明确要求，否则全文必须使用简体中文；不要写英文叙事、英文台词或 Member/Character 这类英文占位称呼。
+2. **叙事与对话**：像 OUO 私聊线下模式一样，自由混合第三人称描写和对话。
+3. **角色说出口的话**：每句角色嘴巴说出口的话行首必须加 \`>>>成员真名：\`，且不加引号。成员真名必须来自群成员列表；不要真的输出“成员真名”四个字，必须替换为具体成员名字。
+4. **心理活动**：角色内心独白或一闪而过的念头，请用**单星号**包裹。
    - 格式：\`*心里的想法*\`
-4. **状态速写（频繁更新）**：
+5. **状态速写（频繁更新）**：
    - 格式：\`[成员真名更新状态为：动作或心情速写]\`
-5. **人称**：全文使用"他/她"或成员真名指代角色，使用"你"指代${myName}，绝不使用"我"。
+6. **人称**：全文使用"他/她"或成员真名指代角色，使用"你"指代${myName}，绝不使用"我"。
 
 **输出示例**：
 \`\`\`
