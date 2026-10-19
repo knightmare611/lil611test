@@ -142,10 +142,7 @@ function generateGroupSystemPrompt(group, retrievedContext = '') {
     - [${myRealName}撤回了一条消息：xxx]：我撤回了刚刚发送的一条消息，xxx是被我撤回的原文。这可能意味着我发错了、说错了话或者改变了主意。你需要根据ai成员们的人设和当前群聊的氛围对此作出自然的反应。
     - [system: ...], [...邀请...加入了群聊], [...修改群名为...]: 系统通知或事件，群成员应据此作出反应，例如欢迎新人、讨论新群名等。\n\n`;
 
-    let outputFormats = isOfflineMode ? `
-  - **叙事/动作/心理**: 直接输出普通小说段落，系统会自动转为旁白气泡。
-  - **角色说话**: >>>{成员真名}：{角色说出口的话}
-  - **状态速写**: [{成员真名}更新状态为：动作或心情速写]\n\n` : `
+    let outputFormats = isOfflineMode ? buildGroupOfflineFormatGuide(group) : `
   - **普通消息**: [{成员真名}的消息：{消息内容}]
   - **发送表情包**: [{成员真名}的表情包：{表情名称}]
   - **语音**: [{成员真名}的语音：{语音转述的文字}]

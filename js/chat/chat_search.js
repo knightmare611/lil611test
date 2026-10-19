@@ -192,7 +192,10 @@ function createSearchResultItem(msg) {
     let senderName = '未知';
     const chat = (currentChatType === 'private') ? db.characters.find(c => c.id === currentChatId) : db.groups.find(g => g.id === currentChatId);
     
-    if (msg.role === 'user') {
+    const narrationText = getNarrationMessageText(msg.content);
+    if (narrationText !== null || msg.offlineType === 'narration') {
+        senderName = '旁白';
+    } else if (msg.role === 'user') {
         senderName = '我';
     } else if (msg.role === 'assistant') {
          if (currentChatType === 'private') {
@@ -207,8 +210,9 @@ function createSearchResultItem(msg) {
 
     // 处理预览内容，移除 Markdown 符号，限制长度
     let previewText = msg.content;
-    const textMatch = msg.content.match(/\[.*?的消息：([\s\S]+?)\]/);
-    if (textMatch) previewText = textMatch[1];
+    const textMatch = msg.content.match(/^\[.*?的消息[:：]([\s\S]*)\]$/);
+    if (narrationText !== null) previewText = narrationText;
+    else if (textMatch) previewText = textMatch[1];
     else if (msg.content.includes('system-narration')) {
         const narMatch = msg.content.match(/\[system-narration:([\s\S]+?)\]/);
         previewText = narMatch ? narMatch[1] : '剧情旁白...';

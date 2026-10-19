@@ -148,7 +148,161 @@ function calculateTypingDelay(text, isFirstMessage) {
 // ==========================================
 // 处理 AI 回复内容解析与渲染
 // ==========================================
-async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChatType) {
+function normalizeOfflineSpeakerName(value) {
+    return String(value || '').normalize('NFKC').trim()
+        .replace(/^[*_【】\[\]"'“”‘’「」『』\s]+|[*_【】\[\]"'“”‘’「」『』\s]+$/g, '')
+        .replace(/\s+/g, '').toLowerCase();
+}
+
+function getGroupOfflineMemberProfiles(group) {
+    return (group.members || []).map(member => {
+        const original = member.originalCharId && (db.characters || []).find(char => char.id === member.originalCharId);
+        return {
+            member,
+            name: original?.realName || member.realName || member.groupNickname || '未命名成员',
+            names: [original?.realName, member.realName].filter(Boolean).map(normalizeOfflineSpeakerName),
+            aliases: [member.groupNickname, original?.remarkName].filter(Boolean).map(normalizeOfflineSpeakerName)
+        };
+    });
+}
+
+function resolveGroupOfflineSpeaker(group, name) {
+    const key = normalizeOfflineSpeakerName(name);
+    if (!key) return null;
+    const profiles = getGroupOfflineMemberProfiles(group);
+    const names = profiles.filter(profile => profile.names.includes(key));
+    if (names.length) return names.length === 1 ? names[0] : null;
+    const aliases = profiles.filter(profile => profile.aliases.includes(key));
+    return aliases.length === 1 ? aliases[0] : null;
+}
+
+function getNarrationMessageText(content) {
+    const match = String(content || '').trim().match(/^\[system-narration\s*[:：]([\s\S]*)\]$/);
+    return match ? match[1] : null;
+}
+
+function getDialogueMessageParts(content) {
+    const match = String(content || '').trim().match(/^\[([^\[\]\n]+?)的消息[:：]([\s\S]*)\]$/);
+    return match ? { name: match[1], text: match[2] } : null;
+}
+
+function findOfflineClosingBracket(text, start) {
+    let depth = 0;
+    for (let index = start; index < text.length; index++) {
+        if (text[index] === '[') depth++;
+        if (text[index] === ']' && --depth === 0) return index;
+    }
+    return -1;
+}
+
+function parseGroupOfflineReply(raw, group) {
+    const text = String(raw || '').replace(/\r\n?/g, '\n').replace(/＞＞＞/g, '>>>')
+        .replace(/<(think|thought|thinking)>[\s\S]*?<\/\1>/gi, '')
+        .replace(/^\s*```\w*\s*$/gm, '')
+        .replace(/^(\s*)(\*\*|__)(>>>[^\n]*?)\2\s*$/gm, '$1$3');
+    const entries = [];
+    const narration = value => { if (value.trim() && !/^[*_]+$/.test(value.trim())) entries.push({ type: 'narration', text: value.trim() }); };
+    const speech = (name, value) => {
+        const speaker = resolveGroupOfflineSpeaker(group, name);
+        const body = value.trim();
+        if (!body) return;
+        if (speaker) entries.push({ type: 'dialogue', speaker, text: body });
+        else narration(`${name.trim()}：${body}`);
+    };
+    const plain = value => {
+        for (let line of value.split('\n')) {
+            line = line.trim();
+            if (!line) continue;
+            const heading = line.match(/^#{1,6}\s+(.+)$/);
+            if (heading && resolveGroupOfflineSpeaker(group, heading[1])) continue;
+            const named = line.match(/^([^：:\n]{1,80})[：:]\s*(.+)$/);
+            if (named && resolveGroupOfflineSpeaker(group, named[1])) speech(named[1], named[2]);
+            else narration(heading ? heading[1] : line);
+        }
+    };
+    const markerPattern = />>>|\[(?:system-narration\s*[:：]|[^\[\]\n]{1,80}?(?:的消息|更新状态为)\s*[:：])/g;
+    const nextMarker = from => {
+        markerPattern.lastIndex = from;
+        let marker;
+        while ((marker = markerPattern.exec(text))) {
+            if (marker[0] === '>>>') return { start: marker.index, marker: marker[0] };
+            const end = findOfflineClosingBracket(text, marker.index);
+            if (end < 0) continue;
+            if (marker[0].includes('更新状态为')) {
+                // 状态只能是独立标签，或位于一句话结束后的尾部；引用中的字样属于正文。
+                const before = text.slice(0, marker.index);
+                const after = text.slice(end + 1);
+                if (!/(?:^|\n|[。！？!?\]])\s*$/.test(before) || !/^(?:\s*(?:\n|>>>|\[|$))/.test(after)) continue;
+            }
+            return { start: marker.index, marker: marker[0], end };
+        }
+        return null;
+    };
+    let cursor = 0;
+    while (cursor < text.length) {
+        const marker = nextMarker(cursor);
+        if (!marker) { plain(text.slice(cursor)); break; }
+        if (marker.start > cursor) plain(text.slice(cursor, marker.start));
+        if (marker.marker === '>>>') {
+            const next = nextMarker(marker.start + 3);
+            const segment = text.slice(marker.start + 3, next ? next.start : text.length).trim();
+            const lines = segment.split('\n');
+            const first = lines.shift() || '';
+            const named = first.match(/^([^：:]{1,80})[：:]\s*([\s\S]*)$/);
+            if (named) speech(named[1], named[2]); else narration(first);
+            // 无标记段落保持旁白，不能猜测它是上一位成员的续行。
+            if (lines.length) plain(lines.join('\n'));
+            cursor = next ? next.start : text.length;
+        } else {
+            const bodyStart = marker.start + marker.marker.length;
+            const body = text.slice(bodyStart, marker.end);
+            const label = marker.marker.match(/^\[(.*?)(的消息|更新状态为)\s*[:：]$/);
+            if (marker.marker.startsWith('[system-narration')) narration(body);
+            else if (label?.[2] === '的消息') speech(label[1], body);
+            else if (label) {
+                const speaker = resolveGroupOfflineSpeaker(group, label[1]);
+                if (speaker && body.trim()) entries.push({ type: 'status', speaker, text: body.trim() });
+                else narration(text.slice(marker.start, marker.end + 1));
+            }
+            cursor = marker.end + 1;
+        }
+    }
+    return entries;
+}
+
+function formatGroupOfflineHistoryText(message, group, content) {
+    const text = String(content ?? message.content ?? '');
+    const narration = getNarrationMessageText(text);
+    if (narration !== null) return narration;
+    const dialogue = getDialogueMessageParts(text);
+    if (dialogue) {
+        if (message.role === 'user') return `${group.me?.realName || group.me?.nickname || dialogue.name}：${dialogue.text}`;
+        const profile = getGroupOfflineMemberProfiles(group).find(item => item.member.id === message.senderId) || resolveGroupOfflineSpeaker(group, dialogue.name);
+        if (!profile) return `${dialogue.name}：${dialogue.text}`;
+        return dialogue.text.split('\n').map(line => `>>>${profile.name}：${line}`).join('\n');
+    }
+    return text;
+}
+
+function buildGroupOfflineFormatGuide(group) {
+    const profiles = getGroupOfflineMemberProfiles(group);
+    const first = profiles[0]?.name || '角色甲';
+    const second = profiles[1]?.name || first;
+    return `叙事、动作和心理活动直接写成普通段落，心理活动可用单星号包裹。
+角色台词每行使用 >>>真实姓名：台词，换行后仍是台词就再次标明姓名。
+只能把能够唯一识别的群成员姓名用作发言标记；不要照抄占位词。
+群外人物或重名无法区分的人物，用普通旁白保留原名字和台词，不冒充群成员。
+状态如有必要，独立一行使用 [真实姓名更新状态为：状态]，不要混进台词。
+不要输出手机消息标签、system-narration 标签、角色标题或包裹整段的加粗标记。
+叙述用第三人称，角色说话可以自然使用“我”。不要替用户编造新的台词或行动。
+格式示例（只参考格式，不照搬剧情）：
+${first}放下杯子，看向门口。
+>>>${first}：我先去看看。
+${second}点了点头。
+>>>${second}：我在这里等你。`;
+}
+
+async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChatType, replyMode) {
     if (!fullResponse) return;
     console.log("🟢 开始处理 AI 回复:", fullResponse.substring(0, 50) + "..."); 
     // ★ 记录本次通话会话ID，用于挂断后中止生成
@@ -193,7 +347,23 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
         }
         // ======== 👆 修复结束 👆 ========
 
-        if ((targetChatType === 'private' && (chat.offlineModeEnabled || chat.callMode === 'video')) || (targetChatType === 'group' && chat.offlineModeEnabled)) {
+        if (targetChatType === 'group' && (replyMode ? replyMode === 'group-offline' : chat.offlineModeEnabled)) {
+            const entries = parseGroupOfflineReply(cleanResponse, chat);
+            let isFirst = true;
+            for (const entry of entries) {
+                await new Promise(resolve => setTimeout(resolve, calculateTypingDelay(entry.text, isFirst)));
+                isFirst = false;
+                const content = entry.type === 'dialogue' ? `[${entry.speaker.name}的消息：${entry.text}]`
+                    : entry.type === 'status' ? `[${entry.speaker.name}更新状态为：${entry.text}]`
+                    : `[system-narration:${entry.text}]`;
+                const message = { id: `msg_${Date.now()}_${Math.random()}`, role: 'assistant', content, parts: [{ type: 'text', text: content }], timestamp: Date.now(), offlineType: entry.type };
+                if (entry.speaker) message.senderId = entry.speaker.member.id;
+                if (entry.type === 'status') entry.speaker.member.status = entry.text;
+                chat.history.push(message);
+                newMessagesForDB.push(message);
+                if (entry.type !== 'status') addMessageBubble(message, targetChatId, targetChatType);
+            }
+        } else if (targetChatType === 'private' && (chat.offlineModeEnabled || chat.callMode === 'video')) {
             let processed = cleanResponse;
             processed = processed.replace(/\r\n/g, '\n');
             processed = processed.replace(/([^\n])\s*(\[.*?[:：])/g, '$1\n$2');
@@ -204,74 +374,6 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
             
             const lines = processed.split('\n');
             let isFirstLine = true;
-            const normalizeGroupSpeakerName = (value = '') => String(value)
-                .replace(/^>>>/, '')
-                .replace(/^[\[\]【】"'“”‘’「」『』]+|[\[\]【】"'“”‘’「」『』]+$/g, '')
-                .replace(/\s+/g, '')
-                .toLowerCase();
-
-            const groupSpeakerAliases = targetChatType === 'group'
-                ? (chat.members || []).map(member => {
-                    const names = [];
-                    if (member.realName) names.push(member.realName);
-                    if (member.groupNickname) names.push(member.groupNickname);
-                    if (member.originalCharId && typeof db !== 'undefined') {
-                        const originalChar = db.characters.find(c => c.id === member.originalCharId);
-                        if (originalChar?.realName) names.push(originalChar.realName);
-                        if (originalChar?.remarkName) names.push(originalChar.remarkName);
-                    }
-                    return names.filter(Boolean).map(name => ({
-                        name,
-                        key: normalizeGroupSpeakerName(name),
-                        memberId: member.id,
-                        displayName: member.realName || member.groupNickname || name
-                    }));
-                }).flat().sort((a, b) => b.name.length - a.name.length)
-                : [];
-            const fallbackGroupSpeaker = targetChatType === 'group'
-                ? chat.members?.[0]?.realName || chat.members?.[0]?.groupNickname || groupSpeakerAliases[0]?.displayName || '群聊成员'
-                : '';
-            const fallbackGroupSenderId = targetChatType === 'group'
-                ? chat.members?.[0]?.id || groupSpeakerAliases[0]?.memberId || null
-                : null;
-
-            const parseGroupOfflineSpeech = (rawSpeech) => {
-                let speech = rawSpeech.trim();
-                let speaker = fallbackGroupSpeaker;
-                let senderId = fallbackGroupSenderId;
-
-                const applyAlias = (alias, nextSpeech) => {
-                    speaker = alias.displayName;
-                    senderId = alias.memberId;
-                    speech = nextSpeech.trim();
-                };
-
-                const speakerMatch = speech.match(/^(.{1,40}?)[：:]\s*([\s\S]+)$/);
-                if (speakerMatch) {
-                    const candidate = speakerMatch[1].trim();
-                    const candidateKey = normalizeGroupSpeakerName(candidate);
-                    const alias = groupSpeakerAliases.find(item =>
-                        item.key && (candidateKey === item.key || candidateKey.includes(item.key) || item.key.includes(candidateKey))
-                    );
-                    if (alias) {
-                        applyAlias(alias, speakerMatch[2]);
-                    } else {
-                        speech = speakerMatch[2].trim();
-                    }
-                } else {
-                    for (const alias of groupSpeakerAliases) {
-                        const aliasKey = alias.key;
-                        const speechKey = normalizeGroupSpeakerName(speech.slice(0, alias.name.length + 2));
-                        if (aliasKey && speechKey.startsWith(aliasKey)) {
-                            applyAlias(alias, speech.slice(alias.name.length).replace(/^[：:\s]+/, ''));
-                            break;
-                        }
-                    }
-                }
-
-                speech = speech.replace(/^(成员真名|群聊成员|member|character)\s*[：:]\s*/i, '').trim();
-                return { speaker, speech, senderId };
-            };
 
             for (let line of lines) {
                 line = line.trim();
@@ -314,33 +416,18 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
                 }
 
                 let messageContent = "";
-                let offlineGroupSenderId = null;
                 if (line.startsWith('>>>')) {
                     let speech = line.substring(3).trim();
                     speech = speech.replace(/\]+$/, '');
                     speech = speech.replace(/^["'「『""'']+/, '').replace(/["'」』""'']+$/, '');
-                    if (targetChatType === 'group') {
-                        const parsed = parseGroupOfflineSpeech(speech);
-                        messageContent = `[${parsed.speaker}的消息：${parsed.speech}]`;
-                        offlineGroupSenderId = parsed.senderId;
-                    } else {
-                        messageContent = `[${chat.realName}的消息：${speech}]`;
-                    }
+                    messageContent = `[${chat.realName}的消息：${speech}]`;
                 } 
                 else if (/^\[.*?的消息：[\s\S]+?\]$/.test(line)) {
-                    const speakerMatch = line.match(/^\[(.*?)的消息：([\s\S]+?)\]$/);
-                    const originalSpeaker = speakerMatch ? speakerMatch[1] : '';
                     const match = line.match(/^\[.*?的消息：([\s\S]+?)\]$/);
                     let speech = match ? match[1] : line;
                     speech = speech.replace(/\]+$/, '');
                     speech = speech.replace(/^["'「『""'']+/, '').replace(/["'」』""'']+$/, '');
-                    if (targetChatType === 'group') {
-                        const parsed = parseGroupOfflineSpeech(`${originalSpeaker}：${speech}`);
-                        messageContent = `[${parsed.speaker}的消息：${parsed.speech}]`;
-                        offlineGroupSenderId = parsed.senderId;
-                    } else {
-                        messageContent = `[${chat.realName}的消息：${speech}]`;
-                    }
+                    messageContent = `[${chat.realName}的消息：${speech}]`;
                 } 
                 else {           
                     let rawText = line.trim();
@@ -369,9 +456,6 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
                     parts:[{ type: 'text', text: messageContent }],
                     timestamp: Date.now()
                 };
-                if (targetChatType === 'group') {
-                    message.senderId = offlineGroupSenderId || fallbackGroupSenderId;
-                }
                 if (chat.currentCallSessionId) message.callSessionId = chat.currentCallSessionId;
                 chat.history.push(message);
                 addMessageBubble(message, targetChatId, targetChatType);
@@ -746,6 +830,7 @@ if (chat.offlineModeEnabled) {
             if (msg.isAiIgnore) return false;
             return true;
         });
+        const replyMode = chatType === 'group' && chat.offlineModeEnabled ? 'group-offline' : 'default';
 
         let offlineReinforcement = null;
 if (chatType === 'private' && chat.offlineModeEnabled) {
@@ -829,21 +914,7 @@ ${worldBooksWriting ? `1. **文风第一**：严格遵循【写作风格】设�
 
 ## 3. 📤 强制输出格式
 1. **语言**：除非${myName}明确要求，否则全文必须使用简体中文；不要写英文叙事、英文台词或 Member/Character 这类英文占位称呼。
-2. **叙事与对话**：像 OUO 私聊线下模式一样，自由混合第三人称描写和对话。
-3. **角色说出口的话**：每句角色嘴巴说出口的话行首必须加 \`>>>成员真名：\`，且不加引号。成员真名必须来自群成员列表；不要真的输出“成员真名”四个字，必须替换为具体成员名字。
-4. **心理活动**：角色内心独白或一闪而过的念头，请用**单星号**包裹。
-   - 格式：\`*心里的想法*\`
-5. **状态速写（频繁更新）**：
-   - 格式：\`[成员真名更新状态为：动作或心情速写]\`
-6. **人称**：全文使用"他/她"或成员真名指代角色，使用"你"指代${myName}，绝不使用"我"。
-
-**输出示例**：
-\`\`\`
-空气停了一瞬，桌边几个人的视线不约而同落到你身上。
-*她刚才那句话，到底是随口一问，还是已经察觉到了什么？*
-某个成员指尖轻轻敲了敲杯沿，先移开了目光。
->>>成员真名：...嗯，也没什么要紧的。[成员真名更新状态为：垂眸掩饰情绪]
-\`\`\`
+${buildGroupOfflineFormatGuide(chat)}
 
 ## 4.🛑 **动笔前的自我灵魂拷问**：
 1. **人设校验**：回到最上方，重新浏览一遍群成员档案，问自己：每个反应符合对应角色的性格吗？如果不符合，调整到符合为止。
@@ -871,7 +942,8 @@ const activeReinforcement = offlineReinforcement || groupOfflineReinforcement ||
                 if (msg.parts && msg.parts.length > 0) {
      parts = msg.parts.map(p => {
         if (p.type === 'text' || p.type === 'html') {
-            let text = p.text; 
+            let text = p.text;
+            if (replyMode === 'group-offline') text = formatGroupOfflineHistoryText(msg, chat, text);
             if (!chat.offlineModeEnabled && !chat.callMode) {
                 text = text.replace(/\[system-narration:([\s\S]*?)\]/g, '$1');
             }
@@ -892,7 +964,7 @@ const activeReinforcement = offlineReinforcement || groupOfflineReinforcement ||
                         return null;
                     }).filter(p => p);
                 } else {
-                    parts = [{ text: processingContent }];
+                    parts = [{ text: replyMode === 'group-offline' ? formatGroupOfflineHistoryText(msg, chat) : (msg.content || '') }];
                 }
                 return { role, parts };
             });
@@ -985,6 +1057,11 @@ const activeReinforcement = offlineReinforcement || groupOfflineReinforcement ||
                     }
                 }
 
+                if (replyMode === 'group-offline') {
+                    content = Array.isArray(content)
+                        ? content.map(part => part.type === 'text' ? { ...part, text: formatGroupOfflineHistoryText(msg, chat, part.text) } : part)
+                        : formatGroupOfflineHistoryText(msg, chat, content);
+                }
                 // 跳过 content 为空的消息，避免部分 API 返回 400
                 const isEmpty = content === null || content === undefined ||
                     (typeof content === 'string' && content.trim() === '') ||
@@ -1031,7 +1108,7 @@ const response = await fetch(endpoint, {
         }
 
         if (streamEnabled) {
-            await processStream(response, chat, provider, chatId, chatType);
+            await processStream(response, chat, provider, chatId, chatType, replyMode);
         } else {
             const result = await response.json();
             let fullResponse = "";
@@ -1040,7 +1117,7 @@ const response = await fetch(endpoint, {
             } else {
                 fullResponse = result.choices[0].message.content || "";
             }
-            await handleAiReplyContent(fullResponse, chat, chatId, chatType);
+            await handleAiReplyContent(fullResponse, chat, chatId, chatType, replyMode);
         }
 
     } catch (error) {
@@ -1073,28 +1150,30 @@ document.getElementById('call-mic-btn')?.removeAttribute('disabled');
 // ==========================================
 // 处理流式输出 (Stream)
 // ==========================================
-async function processStream(response, chat, apiType, targetChatId, targetChatType) {
+async function processStream(response, chat, apiType, targetChatId, targetChatType, replyMode) {
     const reader = response.body.getReader(), decoder = new TextDecoder();
     let fullResponse = "", accumulatedChunk = "";
+    const appendEvent = block => {
+        const data = block.split(/\r?\n/).filter(line => line.startsWith('data:'))
+            .map(line => line.slice(5).replace(/^ /, '')).join('\n').trim();
+        if (!data || data === '[DONE]') return;
+        try {
+            const content = JSON.parse(data).choices?.[0]?.delta?.content;
+            if (typeof content === 'string') fullResponse += content;
+        } catch (error) { /* 不完整事件保留在缓冲区；忽略服务商的非正文事件。 */ }
+    };
     for (; ;) {
         const { done, value } = await reader.read();
         if (done) break;
         accumulatedChunk += decoder.decode(value, { stream: true });
-        if (apiType === "openai" || apiType === "deepseek" || apiType === "claude" || apiType === "newapi") {
-            const parts = accumulatedChunk.split("\n\n");
+        if (apiType !== 'gemini') {
+            const parts = accumulatedChunk.split(/\r?\n\r?\n/);
             accumulatedChunk = parts.pop();
-            for (const part of parts) {
-                if (part.startsWith("data: ")) {
-                    const data = part.substring(6);
-                    if (data.trim() !== "[DONE]") {
-                        try {
-                            fullResponse += JSON.parse(data).choices[0].delta?.content || "";
-                        } catch (e) { /* ignore */ }
-                    }
-                }
-            }
+            for (const part of parts) appendEvent(part);
         }
     }
+    accumulatedChunk += decoder.decode();
+    if (apiType !== 'gemini') appendEvent(accumulatedChunk);
 
     if (apiType === "gemini") {
         try {
@@ -1112,7 +1191,7 @@ async function processStream(response, chat, apiType, targetChatId, targetChatTy
             console.error("Error parsing Gemini stream:", e);
         }
     }
-    await handleAiReplyContent(fullResponse, chat, targetChatId, targetChatType);
+    await handleAiReplyContent(fullResponse, chat, targetChatId, targetChatType, replyMode);
 }
 
 // ==========================================

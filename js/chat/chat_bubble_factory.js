@@ -31,7 +31,7 @@ function createMessageBubbleElement(message) {
         return dividerWrapper; // 提前结束，不渲染头像和气泡
     }
     // --- 渲染旁白气泡 (支持 Markdown) ---
-    const narrationRegex = /\[system-narration:([\s\S]+?)\]/;
+    const narrationRegex = /^\[system-narration[:：]([\s\S]*)\]$/;
     const narrationMatch = content.match(narrationRegex);
 
     if (narrationMatch) {
@@ -154,7 +154,7 @@ function createMessageBubbleElement(message) {
 
     // 2. 【之后判断】不可见消息正则
     const invisibleRegex = /\[.*?(?:接收|退回).*?的转账\]|\[.*?更新状态为：.*?\]|\[.*?已接收礼物\]|\[system:[\s\S]*?\]|\[系统情景通知：.*?\]/;
-    if (invisibleRegex.test(content)) {
+    if (!getDialogueMessageParts(content) && invisibleRegex.test(content)) {
         return null;
     }
 
@@ -244,7 +244,7 @@ function createMessageBubbleElement(message) {
     const privateGiftRegex = /\[(?:.+?)送来的礼物[:：]\s*([\s\S]+?)\]/;
     const groupGiftRegex = /\[(.*?)\s*向\s*(.*?)\s*送来了礼物[:：]\s*([\s\S]+?)\]/;
     const imageRecogRegex = /\[.*?发来了一张图片[:：]\]/;
-    const textRegex = /\[(?:.+?)的消息[:：]\s*([\s\S]+?)\]/;
+    const textRegex = /^\[(?:.+?)的消息[:：]\s*([\s\S]*)\]$/;
     const pomodoroRecordRegex = /\[专注记录\]\s*任务：([\s\S]+?)，时长：([\s\S]+?)，期间与 .*? 互动 (\d+)\s*次。/;
 
     const pomodoroMatch = content.match(pomodoroRecordRegex);
