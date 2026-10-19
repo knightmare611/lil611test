@@ -1,6 +1,10 @@
 let currentNovelStoryId = null;
 let currentNovelChapterIndex = 0;
 let currentNovelStyleId = null;
+const novelGenerationJobs = new Map();
+const novelRewriteDrafts = new Map();
+let novelRewriteContext = null;
+let novelChapterCommitQueue = Promise.resolve();
 
 const DEFAULT_NOVEL_WRITING_STYLES = [
     {
@@ -263,6 +267,7 @@ function renderNovelReader() {
     if (chapterTitle) chapterTitle.textContent = story.chapters.length ? `第 ${currentNovelChapterIndex + 1} 章` : '尚未开篇';
     if (prevBtn) prevBtn.disabled = currentNovelChapterIndex <= 0;
     if (nextBtn) nextBtn.disabled = currentNovelChapterIndex >= story.chapters.length - 1;
+    updateNovelGenerationButtons();
 
     if (!content) return;
     const chapter = story.chapters[currentNovelChapterIndex];
@@ -300,7 +305,11 @@ function closeNovelSettings() {
 function renderNovelCheckboxes() {
     const story = getCurrentNovelStory();
     renderCheckList('novel-worldbook-check-list', db.worldBooks || [], story.worldBookIds, book => book.name || '未命名世界书');
-    renderCheckList('novel-character-check-list', db.characters || [], story.characterIds, char => char.realName || char.remarkName || '未命名角色');
+    const characters = [
+        ...(db.characters || []).map(char => ({ ...char, novelLabel: `角色：${char.realName || char.remarkName || '未命名角色'}` })),
+        ...(db.userPersonas || []).map(persona => ({ ...persona, id: `user:${persona.id}`, novelLabel: `user 人设：${persona.realName || persona.nickname || '未命名人设'}${persona.nickname && persona.realName && persona.nickname !== persona.realName ? `（${persona.nickname}）` : ''}` }))
+    ];
+    renderCheckList('novel-character-check-list', characters, story.characterIds, item => item.novelLabel);
     const chatSources = [
         ...(db.characters || []).map(char => ({ id: `private:${char.id}`, name: `单聊：${char.realName || char.remarkName || '未命名角色'}` })),
         ...(db.groups || []).map(group => ({ id: `group:${group.id}`, name: `群聊：${group.name || '未命名群聊'}` }))
@@ -528,44 +537,160 @@ function moveNovelChapter(delta) {
     renderNovelReader();
 }
 
-async function generateNextNovelChapter(isReroll) {
-    const story = persistNovelSettingsForm();
+function updateNovelGenerationButtons() {
+    const story = getNovelStories().find(item => item.id === currentNovelStoryId);
+    const job = story && novelGenerationJobs.get(story.id);
+    const next = document.getElementById('gr-generate-btn');
+    const rewrite = document.getElementById('gr-reroll-btn');
+    if (next) { next.disabled = !!job; next.textContent = job && !job.isReroll ? '续写中' : '续写'; }
+    if (rewrite) { rewrite.disabled = !!job || !story?.chapters?.length; rewrite.textContent = job?.isReroll ? '重写中' : '重写'; }
+}
+
+function getNovelRewriteModal() {
+    let modal = document.getElementById('novel-rewrite-modal');
+    if (modal) return modal;
+    modal = document.createElement('div');
+    modal.id = 'novel-rewrite-modal';
+    modal.className = 'modal-overlay';
+    modal.innerHTML = `<div class="modal-window novel-settings-window" role="dialog" aria-modal="true" aria-labelledby="novel-rewrite-title">
+        <h3 id="novel-rewrite-title"></h3>
+        <p id="novel-rewrite-hint" style="font-size:13px;line-height:1.6;color:#777;"></p>
+        <label for="novel-rewrite-direction">本章剧情走向</label>
+        <textarea id="novel-rewrite-direction" class="gr-input" rows="7" style="width:100%;min-height:140px;max-height:40vh;resize:vertical;" placeholder="重新填写或修改这章的剧情走向..."></textarea>
+        <div id="novel-rewrite-mode-row" style="margin-top:12px;">
+            <label for="novel-rewrite-mode">重写方式</label>
+            <select id="novel-rewrite-mode" class="gr-input" style="width:100%;">
+                <option value="branch">从本章开始分支，自动新建一本书</option>
+                <option value="replace">替换本章并删除后续章节</option>
+            </select>
+        </div>
+        <p id="novel-rewrite-effect" style="font-size:13px;line-height:1.6;"></p>
+        <div class="novel-settings-actions">
+            <button type="button" class="btn btn-secondary" id="novel-rewrite-cancel">取消</button>
+            <button type="button" class="btn btn-primary" id="novel-rewrite-confirm">确认重写</button>
+        </div>
+    </div>`;
+    document.body.appendChild(modal);
+    const saveDraft = () => {
+        if (novelRewriteContext) novelRewriteDrafts.set(novelRewriteContext.key, document.getElementById('novel-rewrite-direction').value);
+    };
+    modal.querySelector('#novel-rewrite-direction').addEventListener('input', saveDraft);
+    modal.querySelector('#novel-rewrite-mode').addEventListener('change', updateNovelRewriteEffect);
+    modal.querySelector('#novel-rewrite-cancel').addEventListener('click', () => { saveDraft(); modal.classList.remove('visible'); });
+    modal.addEventListener('click', event => { if (event.target === modal && !novelGenerationJobs.has(novelRewriteContext?.storyId)) { saveDraft(); modal.classList.remove('visible'); } });
+    modal.querySelector('#novel-rewrite-confirm').addEventListener('click', () => {
+        if (!novelRewriteContext) return;
+        saveDraft();
+        generateNextNovelChapter(true, { ...novelRewriteContext, direction: modal.querySelector('#novel-rewrite-direction').value, mode: modal.querySelector('#novel-rewrite-mode').value });
+    });
+    return modal;
+}
+
+function updateNovelRewriteEffect() {
+    if (!novelRewriteContext) return;
+    const branch = document.getElementById('novel-rewrite-mode').value === 'branch';
+    document.getElementById('novel-rewrite-effect').textContent = branch
+        ? '生成成功后自动在书架新建一本分支作品，保留之前的章节，并从本章开始新剧情。原书完整保留。'
+        : `生成成功后替换本章${novelRewriteContext.followingCount ? `，并删除其后的 ${novelRewriteContext.followingCount} 章` : ''}。生成失败会保留原内容。`;
+}
+
+function openNovelRewriteDialog() {
+    const story = getCurrentNovelStory();
+    const chapter = story.chapters[currentNovelChapterIndex];
+    if (!chapter || novelGenerationJobs.has(story.id)) return;
+    const modal = getNovelRewriteModal();
+    const key = `${story.id}:${chapter.id || currentNovelChapterIndex}`;
+    novelRewriteContext = { storyId: story.id, chapterIndex: currentNovelChapterIndex, chapterId: chapter.id, key, followingCount: story.chapters.length - currentNovelChapterIndex - 1 };
+    modal.querySelector('#novel-rewrite-title').textContent = `重写《${story.title || '未命名作品'}》第 ${currentNovelChapterIndex + 1} 章`;
+    modal.querySelector('#novel-rewrite-direction').value = novelRewriteDrafts.has(key) ? novelRewriteDrafts.get(key) : (chapter.direction || '');
+    modal.querySelector('#novel-rewrite-hint').textContent = chapter.direction ? '已填入本章上次使用的剧情走向，可修改后重新生成。' : '旧章节未保存原剧情走向，可在这里重新填写。留空则围绕本章原有情节重新创作。';
+    modal.querySelector('#novel-rewrite-mode-row').hidden = !novelRewriteContext.followingCount;
+    modal.querySelector('#novel-rewrite-mode').value = novelRewriteContext.followingCount ? 'branch' : 'replace';
+    modal.querySelector('#novel-rewrite-confirm').disabled = false;
+    modal.querySelector('#novel-rewrite-cancel').disabled = false;
+    modal.querySelector('#novel-rewrite-direction').disabled = false;
+    modal.querySelector('#novel-rewrite-mode').disabled = false;
+    updateNovelRewriteEffect();
+    modal.classList.add('visible');
+}
+
+function commitNovelChapter(job, chapter) {
+    const task = novelChapterCommitQueue.then(async () => {
+        const stories = getNovelStories();
+        const source = stories.find(item => item.id === job.storyId);
+        if (!source || JSON.stringify(source.chapters) !== job.chapterSignature) throw new Error('章节已发生变化，本次生成未覆盖原内容，请重新操作。');
+        let updated;
+        const chapters = job.isReroll ? source.chapters.slice(0, job.chapterIndex).concat(chapter) : source.chapters.concat(chapter);
+        if (job.isReroll && job.mode === 'branch') {
+            let n = 1;
+            let title;
+            do { title = `${source.title || '未命名作品'} · 分支${n++}`; } while (stories.some(item => item.title === title));
+            updated = { ...JSON.parse(JSON.stringify(job.snapshot)), id: createNovelId(), title, chapters: JSON.parse(JSON.stringify(chapters)), branchSourceId: source.id, branchPoint: job.chapterIndex + 1, updatedAt: Date.now() };
+        } else {
+            updated = { ...source, chapters, updatedAt: Date.now() };
+        }
+        const nextStories = updated.id === source.id ? stories.map(item => item.id === source.id ? updated : item) : [updated, ...stories];
+        // 生成结果先成功落库，再切换内存状态，存储失败时原章仍完整保留。
+        if (typeof dexieDB === 'undefined') throw new Error('存储尚未就绪，请稍后重试。');
+        await dexieDB.globalSettings.put({ key: 'novelStories', value: nextStories });
+        db.novelStories = nextStories;
+        return updated;
+    });
+    novelChapterCommitQueue = task.catch(() => {});
+    return task;
+}
+
+async function generateNextNovelChapter(isReroll, rewriteOptions) {
+    if (isReroll && !rewriteOptions) return openNovelRewriteDialog();
+    const story = isReroll ? getNovelStories().find(item => item.id === rewriteOptions.storyId) : getCurrentNovelStory();
+    if (!story || novelGenerationJobs.has(story.id)) return;
     const directionInput = document.getElementById('gr-direction-input');
-    const direction = directionInput?.value || '';
+    const direction = isReroll ? String(rewriteOptions.direction || '') : (directionInput?.value || '');
+    const chapterIndex = isReroll ? rewriteOptions.chapterIndex : story.chapters.length;
+    if (isReroll && (!story.chapters[chapterIndex] || story.chapters[chapterIndex].id !== rewriteOptions.chapterId)) return showToast('目标章节已变化，请重新打开重写。');
     if (!story.premise && !direction && story.chapters.length === 0) {
         showToast('先写一点剧情走向，或在设定里补充故事基调');
         return;
     }
-    const btn = document.getElementById(isReroll ? 'gr-reroll-btn' : 'gr-generate-btn');
-    btn.disabled = true;
-    btn.textContent = isReroll ? '重写中' : '续写中';
+    const job = { storyId: story.id, chapterIndex, chapterSignature: JSON.stringify(story.chapters), snapshot: JSON.parse(JSON.stringify(story)), isReroll, mode: rewriteOptions?.mode || 'replace' };
+    novelGenerationJobs.set(story.id, job);
+    updateNovelGenerationButtons();
+    const modal = document.getElementById('novel-rewrite-modal');
+    if (isReroll && modal) {
+        for (const id of ['confirm', 'cancel', 'direction', 'mode']) modal.querySelector(`#novel-rewrite-${id}`).disabled = true;
+    }
     try {
-        const chapter = await requestNovelChapter(story, direction, isReroll);
-        if (isReroll && story.chapters[currentNovelChapterIndex]) {
-            story.chapters[currentNovelChapterIndex] = chapter;
-        } else {
-            story.chapters.push(chapter);
-            currentNovelChapterIndex = story.chapters.length - 1;
+        const chapter = await requestNovelChapter(job.snapshot, direction, isReroll, chapterIndex);
+        chapter.direction = direction;
+        const updated = await commitNovelChapter(job, chapter);
+        if (currentNovelStoryId === story.id) {
+            currentNovelStoryId = updated.id;
+            currentNovelChapterIndex = updated.chapters.length - 1;
+            if (!isReroll && directionInput?.value === direction) directionInput.value = '';
         }
-        story.updatedAt = Date.now();
-        if (directionInput) directionInput.value = '';
-        await saveNovelStories();
+        if (isReroll) {
+            novelRewriteDrafts.delete(rewriteOptions.key);
+            if (novelRewriteContext?.key === rewriteOptions.key) modal?.classList.remove('visible');
+        }
         renderNovelReader();
         renderNovelScreen();
-        showToast(isReroll ? '本章已重写' : '新章节已生成');
+        showToast(isReroll ? (job.mode === 'branch' ? `已新建《${updated.title}》` : '本章已重写') : '新章节已生成');
     } catch (error) {
         console.error('小说生成失败:', error);
-        showToast('生成失败，请检查 API 设置');
+        showToast(error.message || '生成失败，请检查 API 设置');
     } finally {
-        btn.disabled = false;
-        btn.textContent = isReroll ? '重写' : '续写';
+        novelGenerationJobs.delete(story.id);
+        updateNovelGenerationButtons();
+        if (isReroll && modal && novelRewriteContext?.key === rewriteOptions.key) {
+            for (const id of ['confirm', 'cancel', 'direction', 'mode']) modal.querySelector(`#novel-rewrite-${id}`).disabled = false;
+        }
     }
 }
 
-async function requestNovelChapter(story, direction, isReroll) {
+async function requestNovelChapter(story, direction, isReroll, chapterIndex = currentNovelChapterIndex) {
     const api = db.apiSettings || {};
-    if (!api.url || !api.key || !api.model) return buildNovelFallbackChapter(story, direction);
-    const prompt = buildNovelPrompt(story, direction, isReroll);
+    if (!api.url || !api.key || !api.model) throw new Error('请先在 API 设置中配置地址、密钥和模型，原章节已保留。');
+    const prompt = buildNovelPrompt(story, direction, isReroll, chapterIndex);
     const response = await fetch(`${api.url}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${api.key}` },
@@ -573,15 +698,18 @@ async function requestNovelChapter(story, direction, isReroll) {
     });
     if (!response.ok) throw new Error(`API ${response.status}`);
     const result = await response.json();
-    const text = result.choices?.[0]?.message?.content?.trim();
-    return parseNovelChapter(text || '');
+    const text = result.choices?.[0]?.message?.content;
+    if (typeof text !== 'string' || !text.trim()) throw new Error('API 没有返回小说正文，原章节已保留，请重试。');
+    return parseNovelChapter(text);
 }
 
-function buildNovelPrompt(story, direction, isReroll) {
-    const previous = story.chapters.slice(-3).map((chapter, index) => `前文${index + 1}：${chapter.content}`).join('\n\n');
-    const current = isReroll && story.chapters[currentNovelChapterIndex] ? `\n【需要重写的本章】\n${story.chapters[currentNovelChapterIndex].content}` : '';
+function buildNovelPrompt(story, direction, isReroll, chapterIndex = currentNovelChapterIndex) {
+    const preceding = isReroll ? story.chapters.slice(0, chapterIndex) : story.chapters;
+    const previous = preceding.slice(-3).map((chapter, index) => `第${Math.max(0, preceding.length - 3) + index + 1}章：${chapter.content}`).join('\n\n');
+    const current = isReroll && story.chapters[chapterIndex] ? `\n【待替换的原章草稿，仅作改写参考，不属于前文】\n${story.chapters[chapterIndex].content}` : '';
     const style = getNovelStyleByIdOrName(story.style);
     return `你是绿江连载小说作者。请生成${isReroll ? '重写后的本章' : '下一章'}。
+${isReroll ? `当前正在重写第${chapterIndex + 1}章：从本章之前的剧情接起，按用户的新走向重新创作同一章，替换原章。不得接着原章结尾写下一章，不得把原章或其后内容当作已发生的前文。` : ''}
 要求：第一行写章节标题，后面写正文；不要解释；不要写大纲；正文约1200到2000字；自然吸收聊天素材。
 硬性要求：全文使用第三人称叙事，禁止使用第一人称作为叙述视角；角色说“我”只允许出现在对白中。
 
@@ -605,7 +733,7 @@ ${getNovelChatContext(story.chatSourceIds) || '暂无'}
 ${previous || '暂无，这是第一章。'}${current}
 
 【用户希望本章走向】
-${direction || '请自然推进剧情。'}`;
+${direction || (isReroll ? '保持本章原有情节阶段与主要事件，重新组织叙述、对话和细节；不要继续到下一章。' : '请自然推进剧情。')}`;
 }
 
 function getNovelWorldContext(story) {
@@ -616,10 +744,13 @@ function getNovelWorldContext(story) {
 }
 
 function getNovelCharacterContext(story) {
-    return (db.characters || [])
+    const characters = (db.characters || [])
         .filter(char => story.characterIds.includes(char.id))
-        .map(char => `${char.realName || char.remarkName || '角色'}：${char.persona || ''}`.slice(0, 900))
-        .join('\n');
+        .map(char => `${char.realName || char.remarkName || '角色'}：${char.persona || ''}`.slice(0, 900));
+    const users = (db.userPersonas || [])
+        .filter(persona => story.characterIds.includes(`user:${persona.id}`))
+        .map(persona => `${persona.realName || persona.nickname || '用户角色'}（user 人设${persona.nickname ? `，昵称：${persona.nickname}` : ''}）：${persona.persona || ''}`.slice(0, 900));
+    return characters.concat(users).join('\n');
 }
 
 function getNovelChatContext(sourceIds) {
@@ -644,6 +775,7 @@ function getNovelChatContext(sourceIds) {
 }
 
 function parseNovelChapter(text) {
+    if (typeof text !== 'string' || !text.trim()) throw new Error('小说正文为空，请重试。');
     const clean = text.replace(/^#+\s*/gm, '').trim();
     const lines = clean.split(/\n+/);
     let title = lines[0] || '新的章节';
