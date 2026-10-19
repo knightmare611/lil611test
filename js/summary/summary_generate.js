@@ -241,6 +241,7 @@ async function performGeneration(chat, start, end, type, occurredAtOverride = nu
     };
 
     const _getName = m => {
+        if (getNarrationMessageText(m.content) !== null || m.offlineType === 'narration') return '旁白';
         if (m.role === 'user') return currentChatType === 'private' ? '我' : (chat.me?.realName || '我');
         if (currentChatType === 'private') return chat.realName;
         const sender = chat.members?.find(mem => mem.id === m.senderId);
